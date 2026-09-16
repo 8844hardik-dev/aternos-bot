@@ -310,3 +310,36 @@ app.post("/api/chat", (req, res) => {
 app.listen(PORT, () => {
   console.log(`Sentinel backend listening on port ${PORT}`);
 });
+
+// Keep-Alive / Health Endpoint
+app.get("/api/ping", (req, res) => {
+  res.status(200).send("pong");
+});
+
+// 5-Minute Self-Ping Loop
+const SELF_URL = "https://aternos-bot-nl5e.onrender.com/api/ping";
+
+function startKeepAlive() {
+  const INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+
+  setInterval(async () => {
+    try {
+      const response = await fetch(SELF_URL);
+      if (response.ok) {
+        console.log(`[KEEP-ALIVE] Pinged ${SELF_URL} successfully at ${new Date().toLocaleTimeString()}`);
+      } else {
+        console.warn(`[KEEP-ALIVE] Ping returned status: ${response.status}`);
+      }
+    } catch (err) {
+      console.error(`[KEEP-ALIVE] Ping failed: ${err.message}`);
+    }
+  }, INTERVAL_MS);
+
+  console.log(`[KEEP-ALIVE] Self-ping scheduled every 5 minutes to ${SELF_URL}`);
+}
+
+// Call this right after app.listen
+app.listen(PORT, () => {
+  console.log(`Sentinel backend listening on port ${PORT}`);
+  startKeepAlive();
+});
