@@ -1,349 +1,417 @@
-const express = require('express');
-const cors = require('cors');
-const mineflayer = require('mineflayer');
+/**
+ * Aternos AFK Sentinel — Render Backend
+ * 
+ * Features:
+ *  - 2-Hour Proactive Session Cycling with 160s Break (safely under Aternos's 5-min shutdown)
+ *  - Dynamic Identity Rotation (rotates username suffix across sessions to evade playtime tracking)
+ *  - Physical Coordinate Movement & Micro-Patrols (forward, backward, jump, strafe)
+ *  - Hotbar Slot Cycling (0–8) & Head Rotation
+ *  - 4-Minute Periodic Server Heartbeat (/time query daytime)
+ *  - Auto-Run Command on Spawn (e.g., /gamemode creative)
+ *  - Auto-Respawn & Auto-Reconnect with Exponential Backoff
+ *  - Auto-Leave on Player Join & Instant Rejoin when Server is Empty
+ *  - 4-Minute Internal Self-Ping to prevent Render free-tier sleep
+ *  - Crash Guards (uncaughtException & unhandledRejection handlers)
+ */
+
+const express = require("express");
+const cors = require("cors");
+const mineflayer = require("mineflayer");
+
+// Crash Guards — Prevent Render container exits
+process.on("uncaughtException", (err) => {
+  console.error("[CRASH GUARD] Uncaught Exception:", err);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("[CRASH GUARD] Unhandled Rejection:", reason);
+});
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Global crash protection — never exit with status 1
-process.on('uncaughtException', (err) => {
-  console.error('[CRITICAL] Uncaught exception:', err);
-  addLog(`System error handled: ${err.message || 'Unknown error'}`, 'error');
-});
-process.on('unhandledRejection', (reason) => {
-  console.error('[CRITICAL] Unhandled rejection:', reason);
-});
+const PORT = process.env.PORT || 10000;
+const SELF_PING_URL = "https://aternos-bot-nl5e.onrender.com/api/ping";
 
-let bot = null;
-let reconnectTimer = null;
-let sessionCycleTimer = null;
-let patrolInterval = null;
-let hotbarInterval = null;
-let heartbeatInterval = null;
-let reconnectAttempts = 0;
+// Session Cycling Constants
+const SESSION_DURATION_MS = 2 * 60 * 60 * 1000; // 2 hours in-game
+const SESSION_BREAK_MS = 160 * 1000;             // 2 min 40s offline (safely under Aternos 5-min shutdown)
 
-let botState = {
-  status: 'INACTIVE',
+const state = {
+  status: "INACTIVE", // INACTIVE | CONNECTING | ACTIVE | STANDBY
+  players: 0,
+  retries: 0,
+  startedAt: null,
   config: null,
-  logs: []
+  logs: [],
+  sessionIndex: 1,
+  currentUsername: "",
 };
 
-function addLog(message, type = 'info') {
-  const time = new Date().toLocaleTimeString('en-GB');
-  const entry = { id: Date.now() + Math.random().toString(36).substring(2, 6), time, message, type };
-  botState.logs.unshift(entry);
-  if (botState.logs.length > 100) botState.logs.pop();
-  console.log(`[${time}] [${type.toUpperCase()}] ${message}`);
+let bot = null;
+let logId = 0;
+let reconnectTimer = null;
+let movementTimer = null;
+let hotbarTimer = null;
+let heartbeatTimer = null;
+let sessionCycleTimer = null;
+let breakTimer = null;
+
+function log(level, source, message) {
+  state.logs.push({
+    id: logId++,
+    time: new Date().toISOString(),
+    level,
+    source,
+    message: String(message),
+  });
+  if (state.logs.length > 500) state.logs = state.logs.slice(-500);
 }
 
-function getToggles(config) {
-  const t = config?.toggles || config || {};
-  return {
-    autoRespawn: t.autoRespawn !== false,
-    autoReconnect: t.autoReconnect !== false,
-    autoLeave: t.autoLeave === true,
-    instantRejoin: t.instantRejoin === true,
-    humanMovement: t.humanMovement !== false
-  };
+function clearAllTimers() {
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  if (movementTimer) clearInterval(movementTimer);
+  if (hotbarTimer) clearInterval(hotbarTimer);
+  if (heartbeatTimer) clearInterval(heartbeatTimer);
+  if (sessionCycleTimer) clearTimeout(sessionCycleTimer);
+  if (breakTimer) clearTimeout(breakTimer);
+
+  reconnectTimer = null;
+  movementTimer = null;
+  hotbarTimer = null;
+  heartbeatTimer = null;
+  sessionCycleTimer = null;
+  breakTimer = null;
 }
 
-// ----------------------------------------------------
-// ANTI-AFK: Real Block Movement, Hotbar Cycling & Heartbeat
-// ----------------------------------------------------
-function startAntiAfk() {
-  stopAntiAfk();
+// Generate rotated username (e.g. Sentinel -> Sentinel_1 -> Sentinel_2)
+function getRotatedUsername(baseName) {
+  const clean = (baseName || "Sentinel").replace(/_\d+$/, "");
+  const index = state.sessionIndex;
+  // Suffix rotates through: base, base_1, base_2, base_3
+  if (index === 1) return clean;
+  return `${clean}_${index - 1}`;
+}
 
-  let direction = true;
-
-  // 1. Real Block Walking Loop (runs every 6s)
-  patrolInterval = setInterval(() => {
+// Emulate active human presence
+function startHumanSimulation() {
+  // 1. Coordinate Walking & Micro-Patrols (every 7 seconds)
+  movementTimer = setInterval(() => {
+    if (!bot || !bot.entity || state.status !== "ACTIVE") return;
     try {
-      if (!bot || !bot.entity || botState.status !== 'ACTIVE') return;
-
-      const yaw = direction ? 0 : Math.PI; // Face North, then South
-      const pitch = (Math.random() - 0.5) * 0.4;
+      const yaw = Math.random() * Math.PI * 2 - Math.PI;
+      const pitch = (Math.random() - 0.5) * 0.7;
       bot.look(yaw, pitch, true).catch(() => {});
+      bot.swingArm("right");
 
-      direction = !direction;
+      const dirRoll = Math.random();
+      const moveKey = dirRoll < 0.4 ? "forward" : dirRoll < 0.65 ? "back" : dirRoll < 0.85 ? "left" : "right";
 
-      // Walk for 2.2 seconds to cross block boundaries
-      bot.setControlState('forward', true);
-      if (Math.random() < 0.4) bot.setControlState('jump', true);
+      bot.setControlState(moveKey, true);
+      if (Math.random() < 0.3) bot.setControlState("jump", true);
+      if (Math.random() < 0.25) bot.setControlState("sneak", true);
 
       setTimeout(() => {
-        if (bot) {
-          bot.setControlState('forward', false);
-          bot.setControlState('jump', false);
-          bot.swingArm('right');
-        }
-      }, 2200);
+        if (!bot) return;
+        bot.setControlState("forward", false);
+        bot.setControlState("back", false);
+        bot.setControlState("left", false);
+        bot.setControlState("right", false);
+        bot.setControlState("jump", false);
+        bot.setControlState("sneak", false);
+      }, 1800 + Math.random() * 800);
     } catch (_) {}
-  }, 6000);
+  }, 7000);
 
-  // 2. Hotbar Slot Cycling (runs every 12s)
-  hotbarInterval = setInterval(() => {
+  // 2. Hotbar Slot Cycling (every 12 seconds)
+  hotbarTimer = setInterval(() => {
+    if (!bot || state.status !== "ACTIVE") return;
     try {
-      if (!bot || botState.status !== 'ACTIVE') return;
-      const nextSlot = ((bot.quickBarSlot || 0) + 1) % 9;
-      bot.setQuickBarSlot(nextSlot);
+      const slot = Math.floor(Math.random() * 9);
+      bot.setQuickBarSlot(slot);
     } catch (_) {}
   }, 12000);
 
-  // 3. Command Heartbeat (runs every 4m to refresh server-side player activity)
-  heartbeatInterval = setInterval(() => {
+  // 3. Command Heartbeat to register active operator traffic (every 4 minutes)
+  heartbeatTimer = setInterval(() => {
+    if (!bot || state.status !== "ACTIVE") return;
     try {
-      if (!bot || botState.status !== 'ACTIVE') return;
-      bot.chat('/time query daytime');
+      bot.chat("/time query daytime");
     } catch (_) {}
   }, 4 * 60 * 1000);
 }
 
-function stopAntiAfk() {
-  if (patrolInterval) { clearInterval(patrolInterval); patrolInterval = null; }
-  if (hotbarInterval) { clearInterval(hotbarInterval); hotbarInterval = null; }
-  if (heartbeatInterval) { clearInterval(heartbeatInterval); heartbeatInterval = null; }
-  if (bot) {
-    try {
-      ['forward', 'back', 'left', 'right', 'jump', 'sneak', 'sprint'].forEach((c) => bot.setControlState(c, false));
-    } catch (_) {}
-  }
-}
-
-// ----------------------------------------------------
-// Proactive Session Cycling (Resets Aternos 7-hour TOS counter)
-// ----------------------------------------------------
-const CYCLE_DURATION_MS = 2.5 * 60 * 60 * 1000; // 2.5 hours
-
-function scheduleSessionCycle(config) {
-  if (sessionCycleTimer) clearTimeout(sessionCycleTimer);
-
-  sessionCycleTimer = setTimeout(() => {
-    if (bot && botState.status === 'ACTIVE') {
-      addLog('Proactive session cycle: taking a 45s break to reset Aternos session timer.', 'info');
-      stopAntiAfk();
-      try {
-        bot.quit();
-      } catch (_) {}
-      bot = null;
-      botState.status = 'INACTIVE';
-
-      // Reconnect after 45 seconds
-      setTimeout(() => {
-        addLog('Resuming session after cycle break...', 'info');
-        startBotInstance(config);
-      }, 45000);
+// Helper to decode kick payloads
+function parseKickReason(reason) {
+  if (!reason) return "empty reason";
+  if (typeof reason === "string") return reason;
+  try {
+    if (typeof reason === "object") {
+      if (reason.value && typeof reason.value === "object" && reason.value.text) {
+        return reason.value.text.value || JSON.stringify(reason.value);
+      }
+      if (reason.text) return reason.text;
+      return JSON.stringify(reason);
     }
-  }, CYCLE_DURATION_MS);
+  } catch (_) {}
+  return String(reason);
 }
 
-// ----------------------------------------------------
-// Bot Lifecycle Management
-// ----------------------------------------------------
-function startBotInstance(config) {
-  if (bot) {
-    try { stopAntiAfk(); bot.removeAllListeners(); bot.quit(); } catch (_) {}
-    bot = null;
-  }
+function connect() {
+  const cfg = state.config;
+  if (!cfg) return;
 
-  botState.config = config;
-  botState.status = 'CONNECTING';
-  const toggles = getToggles(config);
-
-  let rawHost = (config.host || '').trim();
-  let port = Number(config.port) || 25565;
-  if (rawHost.includes(':')) {
-    const parts = rawHost.split(':');
-    rawHost = parts[0].trim();
-    const p = Number(parts[1]);
-    if (p) port = p;
-  }
-
-  const username = (config.username || 'Sentinel').trim().replace(/[^a-zA-Z0-9_]/g, '_');
-  const requestedVersion = config.version && config.version !== 'Auto-Detect' ? config.version : false;
-
-  addLog(`Connecting to ${rawHost}:${port} as "${username}" (Version: ${requestedVersion || 'Auto-Detect'})...`, 'info');
-
-  const botOptions = {
-    host: rawHost,
-    port: port,
-    fakeHost: rawHost,
-    username: username,
-    auth: 'offline',
-    checkTimeoutInterval: 30000,
-    connectTimeout: 20000
-  };
-  if (requestedVersion) botOptions.version = requestedVersion;
+  state.status = "CONNECTING";
+  state.currentUsername = getRotatedUsername(cfg.username);
+  log("info", "net", `Connecting to ${cfg.host}:${cfg.port} as "${state.currentUsername}"...`);
 
   try {
-    bot = mineflayer.createBot(botOptions);
+    bot = mineflayer.createBot({
+      host: cfg.host,
+      fakeHost: cfg.host,
+      port: Number(cfg.port) || 25565,
+      username: state.currentUsername,
+      version: cfg.version && cfg.version.toLowerCase() !== "auto-detect" && cfg.version.toLowerCase() !== "custom" ? cfg.version : "1.21.4",
+      auth: "offline",
+      connectTimeout: 15000,
+      checkTimeoutInterval: 30000,
+    });
   } catch (err) {
-    addLog(`Initialization error: ${err.message}`, 'error');
-    botState.status = 'INACTIVE';
-    if (toggles.autoReconnect) scheduleReconnect(config);
+    log("error", "net", `Client instantiation failed: ${err.message}`);
+    scheduleReconnect();
     return;
   }
 
-  bot.once('login', () => addLog(`Logged in as ${bot.username}. Awaiting spawn...`, 'info'));
-
-  bot.once('spawn', () => {
-    botState.status = 'ACTIVE';
-    reconnectAttempts = 0;
-    addLog(`Spawned at (${Math.round(bot.entity.position.x)}, ${Math.round(bot.entity.position.y)}, ${Math.round(bot.entity.position.z)}). Anti-AFK running.`, 'success');
-
-    // Auto-run Creative / OP spawn command
-    const cmd = config.spawnCommand || '/gamemode creative';
-    if (config.enableSpawnCommand !== false) {
-      setTimeout(() => {
-        try {
-          if (bot && botState.status === 'ACTIVE') {
-            bot.chat(cmd);
-            addLog(`Executed spawn command: ${cmd}`, 'chat');
-          }
-        } catch (_) {}
-      }, 2000);
-    }
-
-    if (toggles.humanMovement) startAntiAfk();
-    scheduleSessionCycle(config);
+  bot.once("login", () => {
+    log("info", "net", `Logged in as ${state.currentUsername}. Awaiting spawn...`);
   });
 
-  bot.on('death', () => {
-    addLog('Bot died in server.', 'warning');
-    stopAntiAfk();
-    if (toggles.autoRespawn) {
+  bot.once("spawn", () => {
+    state.status = "ACTIVE";
+    state.startedAt = Date.now();
+    state.retries = 0;
+
+    const pos = bot.entity?.position;
+    const coordStr = pos ? `(${pos.x.toFixed(0)}, ${pos.y.toFixed(0)}, ${pos.z.toFixed(0)})` : "world";
+    log("success", "game", `Spawned at ${coordStr}. Anti-AFK running.`);
+
+    // Auto-Run Spawn Command (e.g. /gamemode creative)
+    const cmd = cfg.spawnCommand || (cfg.enableSpawnCommand ? "/gamemode creative" : null);
+    if (cmd) {
       setTimeout(() => {
+        if (!bot || state.status !== "ACTIVE") return;
         try {
-          if (bot) {
-            bot.respawn();
-            addLog('Auto-respawn triggered.', 'info');
-            if (toggles.humanMovement) startAntiAfk();
-          }
-        } catch (err) { addLog(`Respawn error: ${err.message}`, 'error'); }
+          bot.chat(cmd);
+          log("info", "cmd", `Executed spawn command: ${cmd}`);
+        } catch (_) {}
       }, 1500);
     }
+
+    // Start anti-AFK behaviors
+    const toggles = cfg.toggles || cfg;
+    if (toggles.humanMovement !== false) {
+      startHumanSimulation();
+    }
+
+    // Schedule 2-Hour Proactive Session Cycling
+    sessionCycleTimer = setTimeout(() => {
+      if (state.status !== "ACTIVE" || !bot) return;
+      log("info", "sentinel", "2-hour session limit reached. Taking a 160s break to reset Aternos idle counter...");
+      
+      // Advance identity rotation (1 -> 2 -> 3 -> 4 -> 1)
+      state.sessionIndex = (state.sessionIndex % 4) + 1;
+      
+      state.status = "STANDBY";
+      state.startedAt = null;
+      clearAllTimers();
+
+      try {
+        bot.quit("session_break");
+      } catch (_) {}
+      bot = null;
+
+      // Safe break: 160s (server stays alive for 300s when empty)
+      breakTimer = setTimeout(() => {
+        log("info", "sentinel", `Break completed. Reconnecting as "${getRotatedUsername(cfg.username)}"...`);
+        connect();
+      }, SESSION_BREAK_MS);
+    }, SESSION_DURATION_MS);
   });
 
-  bot.on('playerJoined', (player) => {
-    if (!player || player.username === bot.username) return;
-    addLog(`Player joined: ${player.username}`, 'info');
+  // Auto-Leave when real players join
+  bot.on("playerJoined", (player) => {
+    if (!bot || player.username === bot.username) return;
+    state.players = Math.max(0, Object.keys(bot.players || {}).length - 1);
+    log("info", "game", `Player joined: ${player.username}`);
+
+    const toggles = cfg.toggles || cfg;
     if (toggles.autoLeave) {
-      addLog('Player detected. Auto-leaving...', 'warning');
-      botState.status = 'STANDBY';
-      stopAntiAfk();
-      if (sessionCycleTimer) clearTimeout(sessionCycleTimer);
-      try { bot.quit(); } catch (_) {}
+      log("warn", "sentinel", "Player detected. Leaving server to remain invisible.");
+      state.status = "STANDBY";
+      state.startedAt = null;
+      clearAllTimers();
+      try {
+        bot.quit("player_present");
+      } catch (_) {}
+      bot = null;
     }
   });
 
-  bot.on('playerLeft', (player) => {
-    if (!player || player.username === bot.username) return;
-    addLog(`Player left: ${player.username}`, 'info');
-    if (toggles.instantRejoin && botState.status === 'STANDBY') {
-      const remaining = Object.keys(bot.players || {}).filter((n) => n !== bot.username);
-      if (remaining.length === 0) startBotInstance(config);
+  bot.on("playerLeft", (player) => {
+    if (!bot || player.username === bot.username) return;
+    state.players = Math.max(0, Object.keys(bot.players || {}).length - 1);
+    log("info", "game", `Player left: ${player.username}`);
+
+    const toggles = cfg.toggles || cfg;
+    if (state.status === "STANDBY" && state.players === 0 && toggles.instantRejoin) {
+      log("info", "sentinel", "Server is now empty. Rejoining in 15 seconds...");
+      setTimeout(connect, 15000);
     }
   });
 
-  bot.on('chat', (sender, message) => {
-    if (sender === bot.username) return;
-    addLog(`<${sender}> ${message}`, 'chat');
+  // Auto-Respawn
+  bot.on("death", () => {
+    log("error", "game", "Bot died.");
+    const toggles = cfg.toggles || cfg;
+    if (toggles.autoRespawn !== false) {
+      setTimeout(() => {
+        if (!bot) return;
+        try {
+          bot.respawn();
+          log("info", "sentinel", "Respawn triggered.");
+        } catch (_) {}
+      }, 1000);
+    }
   });
 
-  bot.on('kicked', (reason) => {
-    stopAntiAfk();
-    if (sessionCycleTimer) clearTimeout(sessionCycleTimer);
-    let text = reason;
-    try {
-      const parsed = typeof reason === 'string' ? JSON.parse(reason) : reason;
-      text = parsed?.text || parsed?.extra?.map((e) => e.text).join('') || parsed?.with?.[0] || JSON.stringify(parsed);
-    } catch (_) {}
-    addLog(`Kicked from server: ${text || 'Disconnected'}`, 'warning');
+  bot.on("messagestr", (msg) => {
+    if (!msg || msg.trim().length === 0) return;
+    log("chat", "chat", msg);
   });
 
-  bot.on('error', (err) => addLog(`Connection error: ${err.message}`, 'error'));
+  bot.on("kicked", (reason) => {
+    const text = parseKickReason(reason);
+    log("error", "net", `Kicked from server: ${text}`);
+  });
 
-  bot.on('end', (reason) => {
-    stopAntiAfk();
-    if (sessionCycleTimer) clearTimeout(sessionCycleTimer);
-    addLog(`Disconnected (${reason || 'connection closed'})`, 'warning');
-    if (botState.status !== 'STANDBY') {
-      botState.status = 'INACTIVE';
-      if (toggles.autoReconnect) scheduleReconnect(config);
+  bot.on("error", (err) => {
+    log("error", "net", `Connection error: ${err.message}`);
+  });
+
+  bot.on("end", (reason) => {
+    log("warn", "net", `Disconnected (${reason || "socketClosed"})`);
+    clearAllTimers();
+    bot = null;
+
+    if (state.status === "INACTIVE" || state.status === "STANDBY") {
+      state.startedAt = null;
+      return;
+    }
+
+    state.startedAt = null;
+    const toggles = cfg.toggles || cfg;
+    if (toggles.autoReconnect !== false) {
+      scheduleReconnect();
+    } else {
+      state.status = "INACTIVE";
     }
   });
 }
 
-function scheduleReconnect(config) {
-  if (reconnectTimer) clearTimeout(reconnectTimer);
-  reconnectAttempts++;
-  // Throttled reconnect: wait longer on repeated failures to prevent server bans
-  const delay = Math.min(10000 * Math.pow(1.3, reconnectAttempts - 1), 60000);
-  addLog(`Auto-reconnect scheduled in ${Math.round(delay / 1000)}s (Attempt #${reconnectAttempts})`, 'info');
-  reconnectTimer = setTimeout(() => startBotInstance(config), delay);
+function scheduleReconnect() {
+  state.retries += 1;
+  const delay = Math.min(10 * Math.pow(1.3, Math.min(state.retries, 10)), 60) * 1000;
+  state.status = "CONNECTING";
+  log("info", "sentinel", `Auto-reconnect scheduled in ${Math.round(delay / 1000)}s (Attempt #${state.retries})`);
+  reconnectTimer = setTimeout(connect, delay);
 }
 
-// ---------------- REST Endpoints ----------------
-app.get('/api/ping', (req, res) => res.status(200).send('pong'));
+// Keep Render Awake: 4-minute self ping
+setInterval(async () => {
+  try {
+    await fetch(SELF_PING_URL, { signal: AbortSignal.timeout(10000) });
+  } catch (_) {}
+}, 4 * 60 * 1000);
 
-app.get('/api/status', (req, res) => {
+/* ================= HTTP ENDPOINTS ================= */
+
+app.get("/", (_req, res) => res.send("Aternos AFK Sentinel 24/7 Backend Active"));
+app.get("/api/ping", (_req, res) => res.send("pong"));
+
+app.get("/api/status", (_req, res) => {
   res.json({
-    state: botState.status,
-    logs: botState.logs,
-    activePlayers: bot ? Object.keys(bot.players || {}).filter((n) => n !== bot.username) : []
+    status: state.status,
+    players: state.players,
+    uptime: state.startedAt ? Math.floor((Date.now() - state.startedAt) / 1000) : 0,
+    retries: state.retries,
+    username: state.currentUsername || (state.config && state.config.username) || "Sentinel",
+    sessionIndex: state.sessionIndex,
+    logs: state.logs,
   });
 });
 
-app.post('/api/start', (req, res) => {
-  const config = req.body;
-  if (!config || !config.host) return res.status(400).json({ error: 'Host is required' });
-  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-  if (sessionCycleTimer) { clearTimeout(sessionCycleTimer); sessionCycleTimer = null; }
-  reconnectAttempts = 0;
-  addLog(`Activation requested for ${config.host}:${config.port || 25565}`, 'info');
-  startBotInstance(config);
-  res.json({ success: true, message: 'Bot activation initiated' });
+app.post("/api/start", (req, res) => {
+  const { host, port, username, version, toggles, spawnCommand, enableSpawnCommand } = req.body;
+  if (!host || !username) {
+    return res.status(400).json({ error: "Host and username are required." });
+  }
+
+  clearAllTimers();
+  if (bot) {
+    try {
+      bot.quit("manual_restart");
+    } catch (_) {}
+    bot = null;
+  }
+
+  state.config = {
+    host,
+    port: Number(port) || 25565,
+    username,
+    version,
+    toggles: toggles || {},
+    spawnCommand,
+    enableSpawnCommand,
+  };
+
+  state.sessionIndex = 1;
+  state.retries = 0;
+  state.startedAt = null;
+
+  connect();
+  res.json({ message: "Sentinel bot activation initiated." });
 });
 
-app.post('/api/stop', (req, res) => {
-  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-  if (sessionCycleTimer) { clearTimeout(sessionCycleTimer); sessionCycleTimer = null; }
-  reconnectAttempts = 0;
-  stopAntiAfk();
-  if (bot) { try { bot.removeAllListeners(); bot.quit(); } catch (_) {} bot = null; }
-  botState.status = 'INACTIVE';
-  addLog('Bot deactivated manually by user', 'info');
-  res.json({ success: true, message: 'Bot stopped' });
+app.post("/api/stop", (_req, res) => {
+  clearAllTimers();
+  state.status = "INACTIVE";
+  state.startedAt = null;
+  if (bot) {
+    try {
+      bot.quit("manual_stop");
+    } catch (_) {}
+    bot = null;
+  }
+  log("info", "dashboard", "Bot deactivated manually by user.");
+  res.json({ message: "Sentinel bot deactivated." });
 });
 
-app.post('/api/chat', (req, res) => {
+app.post("/api/chat", (req, res) => {
   const { message } = req.body;
-  if (!message) return res.status(400).json({ error: 'Message required' });
-  if (!bot || botState.status !== 'ACTIVE') return res.status(400).json({ error: 'Bot is not active in-game' });
+  if (!message) return res.status(400).json({ error: "Message is required." });
+  if (!bot || state.status !== "ACTIVE") {
+    return res.status(400).json({ error: "Bot is not active in-game." });
+  }
   try {
     bot.chat(message);
-    addLog(`Sent command/chat: ${message}`, 'chat');
-    res.json({ success: true });
+    log("chat", "sentinel", `> ${message}`);
+    res.json({ message: "Sent to server." });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Self-ping cron to keep Render awake (every 4 min)
-const SELF_URL = 'https://aternos-bot-nl5e.onrender.com/api/ping';
-function startSelfPingCron() {
-  setInterval(async () => {
-    try {
-      const res = await fetch(SELF_URL, { signal: AbortSignal.timeout(10000) });
-      console.log(`[SELF-PING] ${new Date().toISOString()} -> ${res.status}`);
-    } catch (err) {
-      console.warn(`[SELF-PING] failed: ${err.message}`);
-    }
-  }, 4 * 60 * 1000);
-}
-
-const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  addLog(`Sentinel backend initialized on port ${PORT}`, 'info');
-  startSelfPingCron();
+  console.log(`Sentinel backend running on port ${PORT}`);
+  log("info", "sys", `Sentinel backend initialized on port ${PORT}`);
 });
